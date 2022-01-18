@@ -38,8 +38,8 @@ async function getBooks(file: string): Promise<Book[]> {
     if (!record.ISBN) {
       record.ISBN = record.Text
     }
-    if (!record.Created) {
-      record.Created = new Date(`${record.Date} ${record.Time}`)
+    if (!record.Created && record.Date && record.Time) {
+      record.Created = new Date(`${record.Date} ${record.Time}`).toISOString()
     }
     return record
   })
@@ -74,7 +74,7 @@ async function addAuthorAndDate(books: Book[]): Promise<void> {
       }
 
       if (!book.Published) {
-        book.Published = new Date(json[`ISBN:${book.ISBN}`].publish_date)
+        book.Published = new Date(json[`ISBN:${book.ISBN}`].publish_date).toISOString()
       }
     }
     await CSV.write(books, env.INPUT_CSV)
@@ -138,7 +138,7 @@ async function getLccn(driver: WebDriver, book: Book, title: string): Promise<st
       }
     }
     if (!match && book.Published && (await elementExists(results[i], dateLocator))) {
-      const year = book.Published.getFullYear()
+      const year = new Date(book.Published).getFullYear()
       const date = await results[i].findElement(dateLocator).findElement(By.css('span')).getText()
       if (date === year.toString()) {
         console.log(`Matched LCCN by date for ISBN '${book.ISBN}'`)
@@ -212,6 +212,6 @@ type Book = {
   Time: string
   Title?: string
   Author?: string
-  Published?: Date
+  Published?: string
   LCCN?: string
 }
