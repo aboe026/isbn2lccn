@@ -2,13 +2,17 @@ import { config } from 'dotenv'
 config()
 
 import CSV from './csv'
+import { Builder, By, Locator, WebDriver, WebElement } from 'selenium-webdriver'
 import fetch from 'node-fetch'
 import fs from 'fs-extra'
 import path from 'path'
 import { platform } from 'os'
-import { Builder, By, until, Locator, WebDriver, WebElement } from 'selenium-webdriver'
+import prettyMilliseconds from 'pretty-ms'
 
 import env from './env'
+import { LccnHeuristic, LccnHeuristicInput } from './lccn-heuristic'
+
+const NOT_AVAILABLE = 'N/A'
 ;(async () => {
   try {
     await validateEnv()
@@ -47,8 +51,8 @@ async function getBooks(file: string): Promise<Book[]> {
 
 async function addAuthorAndDate(books: Book[]): Promise<void> {
   for (const book of books) {
-    if (!book.Title || !book.Published) {
-      console.log(`Getting title and author of '${book.ISBN}'...`)
+    if (!book.Title || !book.Author || !book.Published) {
+      console.log(`Getting title, author and publish date of '${book.ISBN}'...`)
       const response = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${book.ISBN}&format=json&jscmd=data`)
       const text = await response.text()
       let json
@@ -58,26 +62,35 @@ async function addAuthorAndDate(books: Book[]): Promise<void> {
         throw Error(`Could not parse ISBN '${book.ISBN}' response of '${text}' as JSON: ${err}`)
       }
 
+      let title, author, published
+      const info = json[`ISBN:${book.ISBN}`]
+      if (info) {
+        if (info.title) {
+          title = info.title
+          if (title.endsWith('.')) {
+            title = title.substring(0, title.length - 1)
+          }
+        }
+
+        if (info.authors) {
+          author = info.authors[0].name
+        }
+
+        if (info.publish_date) {
+          published = new Date(info.publish_date).toISOString()
+        }
+      }
       if (!book.Title) {
-        let title: string = json[`ISBN:${book.ISBN}`].title
-        if (title.endsWith('.')) {
-          title = title.substring(0, title.length - 1)
-        }
-        book.Title = title
+        book.Title = title || NOT_AVAILABLE
       }
-
       if (!book.Author) {
-        const author = json[`ISBN:${book.ISBN}`].authors ? json[`ISBN:${book.ISBN}`].authors[0].name : undefined
-        if (author) {
-          book.Author = author
-        }
+        book.Author = author || NOT_AVAILABLE
       }
-
       if (!book.Published) {
-        book.Published = new Date(json[`ISBN:${book.ISBN}`].publish_date).toISOString()
+        book.Published = published || NOT_AVAILABLE
       }
     }
-    await CSV.write(books, env.INPUT_CSV)
+    await CSV.write(books, env.OUTPUT_CSV)
   }
 }
 
@@ -88,92 +101,205 @@ function addWebDriversToPath() {
 }
 
 async function addLccns(books: Book[]): Promise<void> {
-  const driver = await new Builder().forBrowser('chrome').build()
-  try {
-    for (const book of books) {
-      if (!book.LCCN) {
-        book.LCCN = await getLccn(driver, book, book.Title || '')
-        if (book.LCCN === 'N/A' && book.Name !== book.Title) {
-          book.LCCN = await getLccn(driver, book, book.Name)
+  let processed = 0
+  const totalWithoutLccN = books.filter((book) => !book.LCCN).length
+  if (totalWithoutLccN > 0) {
+    const start = Date.now()
+    const driver = await new Builder().forBrowser('chrome').build()
+    try {
+      for (const book of books) {
+        if (!book.LCCN) {
+          const lccn = await getLccn(driver, book)
+          if (lccn) {
+            book.LCCN = lccn.value
+            book.Link = `https://lccn.loc.gov/${book.LCCN}`
+            book.Verified = LccnHeuristic.deserialize(lccn.score).Verified ? 'yes' : 'no'
+            if (book.Verified !== 'yes') {
+              console.log(`Could not verify ISBN '${book.ISBN}' against LCCN '${book.LCCN}'`)
+            }
+          } else {
+            console.log(`Could not determine LCCN for ISBN '${book.ISBN}', marking as '${NOT_AVAILABLE}'`)
+            book.LCCN = NOT_AVAILABLE
+            book.Link = ''
+            book.Verified = ''
+          }
+          await CSV.write(books, env.OUTPUT_CSV)
+          processed++
+          const percent = processed / totalWithoutLccN
+          const msElapsed = Date.now() - start
+          const msEstTotal = (msElapsed * totalWithoutLccN) / processed
+          const timingPrintout =
+            processed === totalWithoutLccN
+              ? `took ${prettyMilliseconds(msElapsed)}`
+              : `estimated ${prettyMilliseconds(msEstTotal - msElapsed)} remaining`
+          console.log(
+            `Processed ${Number(percent).toLocaleString(undefined, {
+              style: 'percent',
+              minimumFractionDigits: 0,
+            })} (${processed}/${totalWithoutLccN}), ${timingPrintout}`
+          )
         }
-        await CSV.write(books, env.INPUT_CSV)
       }
+    } catch (err) {
+      await captureScreenshot(driver, 'error')
+      throw err
+    } finally {
+      await driver.quit()
     }
-  } catch (err) {
-    const image = await driver.takeScreenshot()
-    const screenshotsDir = path.join(__dirname, '../screenshots')
-    await fs.ensureDir(screenshotsDir)
-    const fileName = path.join(screenshotsDir, `${new Date().toISOString().replace(/:|\./g, '-')}.png`)
-    console.log(`Saving screenshot to '${fileName}'...`)
-    await fs.writeFile(fileName, image, {
-      encoding: 'base64',
-    })
-    throw err
-  } finally {
-    await driver.quit()
   }
 }
 
-async function getLccn(driver: WebDriver, book: Book, title: string): Promise<string> {
-  console.log(`Getting LCCN for ISBN '${book.ISBN}' and title '${title}'...`)
-  await driver.get(`https://www.loc.gov/books/?all=true&q=${title.replace(/\ /g, '+')}`)
-  const searchResultElement = By.id('results')
-  await driver.wait(until.elementLocated(searchResultElement), 1000 * 20)
-  const results = await driver.findElement(searchResultElement).findElement(By.css('ul')).findElements(By.css('li'))
-  const formattedAuthor = book.Author
-    ? book.Author.includes(', ')
-      ? book.Author
-      : book.Author.split(' ').reverse().join(', ')
-    : ''
-  let match
-  for (let i = 0; i < results.length && !match; i++) {
+async function getLccn(driver: WebDriver, book: Book): Promise<LCCN> {
+  let lccns: LCCN[] = []
+  if (book.Title !== NOT_AVAILABLE) {
+    lccns = sortLccnResults(lccns, await getPotentialLccns(driver, book, book.Title || ''))
+    if (lccns && lccns.length > 0 && LccnHeuristic.deserialize(lccns[0].score).Verified) {
+      return lccns[0]
+    }
+  }
+  if (book.Name !== book.Title) {
+    lccns = sortLccnResults(lccns, await getPotentialLccns(driver, book, book.Name))
+    if (lccns && lccns.length > 0 && LccnHeuristic.deserialize(lccns[0].score).Verified) {
+      return lccns[0]
+    }
+    if (book.Title?.includes(' by ')) {
+      const title = book.Title ? book.Title.replace(/\ by\ .*/, '') : ''
+      lccns = sortLccnResults(lccns, await getPotentialLccns(driver, book, title))
+      if (lccns && lccns.length > 0 && LccnHeuristic.deserialize(lccns[0].score).Verified) {
+        return lccns[0]
+      }
+      if (book.Name.includes(' by ')) {
+        lccns = sortLccnResults(lccns, await getPotentialLccns(driver, book, book.Name.replace(/\ by\ .*/, '')))
+        if (lccns && lccns.length > 0 && LccnHeuristic.deserialize(lccns[0].score).Verified) {
+          return lccns[0]
+        }
+      }
+    }
+  }
+  return lccns[0]
+}
+
+function sortLccnResults(first: LCCN[], second: LCCN[]): LCCN[] {
+  const merged = first.concat(second)
+  return merged.sort((a, b) => b.score - a.score) // sort in descending order -> largest values first, smallest last
+}
+
+async function getPotentialLccns(driver: WebDriver, book: Book, title: string): Promise<LCCN[]> {
+  const lccns = await getMatchingLccns(driver, book, title)
+  let verified
+  for (let i = 0; i < lccns.length && !verified; i++) {
+    if (await verifyIsbn(driver, lccns[i].value, book.ISBN)) {
+      verified = true
+      lccns[i].score = LccnHeuristic.update({ existing: lccns[i].score, newVerified: true })
+    }
+  }
+  return lccns
+}
+
+async function refreshPageUntilResults(
+  driver: WebDriver,
+  url: string,
+  start: number | undefined,
+  timeout: number
+): Promise<WebElement[]> {
+  if (!start) {
+    start = Date.now()
+    await promiseTimeout(driver.get(url), env.PAGE_TIMEOUT_MS)
+  }
+  if (Date.now() >= start + timeout) {
+    throw Error('Timeout tring to load search results')
+  }
+  await sleep(1000)
+  const searchResultElement = By.css('#results > ul > li')
+  if (await elementExists(driver, searchResultElement)) {
+    return driver.findElements(searchResultElement)
+  } else if (await elementExists(driver, By.className('site-error'))) {
+    await driver.get(url) // site error, refresh page and to try again
+    return refreshPageUntilResults(driver, url, start, timeout)
+  } else if (await elementExists(driver, By.className('noresults-for'))) {
+    return []
+  }
+  return refreshPageUntilResults(driver, url, start, timeout)
+}
+
+async function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve()
+    }, milliseconds)
+  })
+}
+
+async function promiseTimeout(promise: Promise<any>, timeoutMs: number): Promise<any> {
+  let timeoutHandle: NodeJS.Timeout
+  const timeoutPromise = new Promise((resolve, reject) => {
+    timeoutHandle = setTimeout(() => reject(`Timeout of '${timeoutMs}' milliseconds exceeded for promise`), timeoutMs)
+  })
+
+  return Promise.race([promise, timeoutPromise]).then((result) => {
+    clearTimeout(timeoutHandle)
+    return result
+  })
+}
+
+async function getMatchingLccns(driver: WebDriver, book: Book, title: string): Promise<LCCN[]> {
+  const lccns: LCCN[] = []
+  console.log(`Attempting to get LCCN for ISBN '${book.ISBN}' with title '${title}'...`)
+  const url = `https://www.loc.gov/books/?all=true&q=${title.replace(/\ /g, '+')}`
+  console.log(`Accessing URL '${url}'`)
+  const results: WebElement[] = await refreshPageUntilResults(driver, url, undefined, env.PAGE_TIMEOUT_MS)
+  for (let i = 0; i < results.length; i++) {
     const contributorLocator = By.className('contributor')
     const dateLocator = By.className('date')
     const titleLocator = By.className('item-description-title')
-    if (book.Author && (await elementExists(results[i], contributorLocator))) {
-      const author = (await results[i].findElement(contributorLocator).getText()).replace(/Contributor\: /, '')
-      if (author === formattedAuthor) {
-        console.log(`Matched LCCN by author for ISBN '${book.ISBN}'`)
-        match = results[i]
+    const heuristicInput: LccnHeuristicInput = LccnHeuristic.deserialize(0)
+
+    if (await elementExists(results[i], titleLocator)) {
+      const name = (await results[i].findElement(titleLocator).findElement(By.css('a')).getText())
+        .trim()
+        .replace(/\ \//, '') // get rid of slash ("/") the UI has for title / author
+      if (name.toLowerCase() === title.toLowerCase()) {
+        heuristicInput.Matches.Title = true
       }
     }
-    if (!match && book.Published && (await elementExists(results[i], dateLocator))) {
+    if (book.Author && (await elementExists(results[i], contributorLocator))) {
+      const author = (await results[i].findElement(contributorLocator).getText()).replace(/Contributor\: /, '')
+      const formattedAuthor = book.Author.includes(', ') ? book.Author : book.Author.split(' ').reverse().join(', ')
+      if (author === formattedAuthor) {
+        heuristicInput.Matches.Author = true
+      }
+    }
+    if (book.Published && (await elementExists(results[i], dateLocator))) {
       const year = new Date(book.Published).getFullYear()
       const date = await results[i].findElement(dateLocator).findElement(By.css('span')).getText()
       if (date === year.toString()) {
-        console.log(`Matched LCCN by date for ISBN '${book.ISBN}'`)
-        match = results[i]
+        heuristicInput.Matches.Date = true
       }
     }
-    if (!match && (await elementExists(results[i], titleLocator))) {
-      const name = (await results[i].findElement(titleLocator).findElement(By.css('a')).getText())
-        .trim()
-        .replace(/\ \//, '')
-      if (name.toLowerCase() === title.toLowerCase()) {
-        console.log(`Matched LCCN by title for ISBN '${book.ISBN}'`)
-        match = results[i]
+
+    let score = LccnHeuristic.serialize(heuristicInput)
+    if (score > 0) {
+      const lccn = await getResultLccn(results[i])
+      if (lccn) {
+        score = LccnHeuristic.update({ existing: score, newIndex: results.length - i })
+        console.log(`Matched ISBN '${book.ISBN}' to LCCN '${lccn}' with heuristic score '${score}'`)
+        lccns.push({
+          value: lccn,
+          score,
+        })
       }
     }
   }
-  if (match) {
-    const link = await driver
-      .findElement(By.className('item-description-title'))
-      .findElement(By.css('a'))
-      .getAttribute('href')
-    const lccn = link.split('/').at(-1) || ''
-    if (env.VERIFY_ISBN) {
-      console.log(
-        `Verifying ISBN '${book.ISBN}' for LCCN '${lccn}' due to 'VERIFY_ISBN' environment variable set to 'true'...`
-      )
-      if (await verifyIsbn(driver, lccn, book.ISBN)) {
-        return lccn
-      }
-      console.log(`Could not verify ISBN '${book.ISBN}' against LCCN '${lccn}'`)
-      return 'N/A'
-    }
-    return lccn
-  }
-  return 'N/A'
+  return sortLccnResults(lccns, [])
+}
+
+async function getResultLccn(result: WebElement): Promise<string> {
+  const link = await result
+    .findElement(By.className('item-description-title'))
+    .findElement(By.css('a'))
+    .getAttribute('href')
+  const matches = link.match(/https:\/\/lccn\.loc\.gov\/(\d+)/)
+  return matches ? matches[1] : ''
 }
 
 async function elementExists(driver: WebDriver | WebElement, locator: Locator): Promise<boolean> {
@@ -189,19 +315,38 @@ async function elementExists(driver: WebDriver | WebElement, locator: Locator): 
 }
 
 async function verifyIsbn(driver: WebDriver, lccn: string, isbn: string): Promise<boolean> {
-  console.log(`Found LCCN '${lccn}', verifying against ISBN '${isbn}'...`)
-
+  console.log(`Verifying against ISBN '${isbn}' against LCCN '${lccn}'...`)
   await driver.get(`https://lccn.loc.gov/${lccn}`)
-  const isbnTitle = await driver.findElement(By.xpath("//*[ contains (text(), 'ISBN' ) ]"))
-  const isbns = await isbnTitle.findElement(By.xpath('./..')).findElement(By.css('ul')).findElements(By.css('li'))
-  console
-  let verified = false
-  for (let j = 0; j < isbns.length && !verified; j++) {
-    if ((await isbns[j].findElement(By.css('span')).getText()) === isbn) {
-      verified = true
+  const isbnLocator = By.xpath("//*[contains(@class, 'item-title') and contains(text(), 'ISBN' ) ]")
+  if (await elementExists(driver, isbnLocator)) {
+    const isbnTitle = await driver.findElement(isbnLocator)
+    const listedIsbns = await isbnTitle.findElements(By.xpath('./../ul/li'))
+    for (const listedIsbn of listedIsbns) {
+      const text = await listedIsbn.findElement(By.css('span')).getText()
+      const digits = text.match(/[\D+]?(\d+)[\D+]?/) // ignore non-digit groups - eg " (hardcover)" or " (ebook)"
+      if (digits && digits[0].trim() === isbn) {
+        return true
+      }
     }
   }
-  return verified
+
+  return false
+}
+
+async function captureScreenshot(driver: WebDriver, namePrefix: string): Promise<void> {
+  const image = await driver.takeScreenshot()
+  const screenshotsDir = path.join(__dirname, '../screenshots')
+  await fs.ensureDir(screenshotsDir)
+  const filePath = path.join(screenshotsDir, `${namePrefix}-${new Date().toISOString().replace(/:|\./g, '-')}.png`)
+  console.log(`Saving screenshot to '${filePath}'...`)
+  await fs.writeFile(filePath, image, {
+    encoding: 'base64',
+  })
+}
+
+type LCCN = {
+  value: string
+  score: number
 }
 
 type Book = {
@@ -214,4 +359,6 @@ type Book = {
   Author?: string
   Published?: string
   LCCN?: string
+  Link?: string
+  Verified?: string
 }

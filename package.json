@@ -31,6 +31,7 @@
     "envalid": "7.2.2",
     "fs-extra": "10.0.0",
     "node-fetch": "2.6.6",
+    "pretty-ms": "7.0.1",
     "selenium-webdriver": "4.1.1"
   },
   "devDependencies": {
@@ -38,6 +39,7 @@
     "@types/csv-stringify": "3.1.0",
     "@types/fs-extra": "9.0.13",
     "@types/node-fetch": "2.5.12",
+    "@types/pretty-ms": "5.0.1",
     "@types/selenium-webdriver": "4.0.16",
     "@typescript-eslint/parser": "5.9.1",
     "@typescript-eslint/eslint-plugin": "5.9.1",
